@@ -1,0 +1,5 @@
+nnet_object.lo: nnet_object.cpp /usr/include/stdc-predef.h nnet_object.h
+
+/usr/include/stdc-predef.h:
+
+nnet_object.h:

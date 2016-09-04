@@ -1,0 +1,775 @@
+classdef IA < handle
+    
+    properties ( Access = private )
+       TYPE_INPUT = 1
+       TYPE_CONTEXT = 2
+       TYPE_IM = 3
+       TYPE_BOOTSTRAPING = 4
+       TYPE_EMPTY = 0
+    end
+    
+    
+    properties 
+        modules
+        modules_type
+        next_index
+        connections
+        
+        threshold
+        graphs
+        network_graph
+        network_graph_count
+        network_graph_plot
+        network_graph_fig_no
+        
+        
+        gain
+        centroids_multiplier
+        
+        sampling_percentage
+        
+        wm
+    end
+    
+    properties
+        UseGPU
+        im_ca
+    end
+    
+    methods
+        
+        function ia = IA(treshold, gain)
+            size = 1;
+            
+            ia.UseGPU = 0;
+            
+            ia.modules = cell(size,1);
+            ia.next_index = 1;
+            ia.modules_type = zeros(size,1);
+            ia.connections = zeros(size, 1);
+            ia.threshold = treshold;
+            ia.gain = gain;
+            
+            ia.centroids_multiplier = 1;
+            
+            ia.sampling_percentage = 1;
+            
+            ia.wm = WM();
+            ia.wm.init();
+            ia.graphs = cell(size,1);
+            
+            
+            count = ia.CountModules();
+            ia.network_graph = digraph(ia.connections(1:count, 1:count));
+            ia.network_graph_count = 0;
+            ia.network_graph_fig_no = 42;
+            
+            figure(ia.network_graph_fig_no);
+            ia.network_graph_plot = plot(ia.network_graph);
+        end
+        
+        function set.UseGPU(ia, val)
+           ia.UseGPU = val;
+           r = ia.UseGPU();
+        end
+        
+        function c = CountModules(ia)
+            c = ia.next_index - 1;
+        end
+        
+        function s = MaxSize(ia)
+           s = length(ia.modules); 
+        end
+        
+        function input_module = NewFilterNode(ia, input_size, filterFunction)
+            index = ia.NextIndex(ia.TYPE_INPUT);
+            module = [];
+            module.input = zeros(1, input_size);
+            module.output = zeros(1, input_size);
+            module.activation = 1;
+            module.reward = 0;
+            module.output_changed = false;
+            
+            ia.modules{index} = module;
+            input_module = FilterNode(ia, index, input_size, filterFunction);
+        end
+        
+        function bs = IsBootstraping(ia, indeces)
+            bs = ia.modules_type(indeces);
+            
+            bs = bs == ia.TYPE_BOOTSTRAPING;
+        end
+        
+        function index = NewIntentionalModule(ia, sources, training_set_size, output_size)
+            index = ia.NextIndex(ia.TYPE_BOOTSTRAPING);
+            ia.connections(index, sources) = 1;
+            input_size = ia.GetModuleOutputSize(sources);
+            
+            module = [];
+            module.index = index;
+            module.sources = sources;
+            module.input = zeros( 1, input_size );
+            module.output = zeros( 1, output_size );
+            module.similarities = zeros( 1, output_size );
+            module.threshold = ia.threshold;
+            module.bootstraping = true;
+            module.training_set = zeros(training_set_size, input_size);
+            module.sampling_weights = ones(training_set_size,1);
+            module.training_count = 0;
+            module.ica = [];
+            module.pca = [];
+            module.centroids = [];
+            module.centroids_mean_distance = [];
+            module.activation = 0;
+            module.output_changed = false;
+            module.xx = 0;
+            
+%             module.wm_index = ia.wm.NewWMModule(1, output_size, output_size);
+%             
+%             ia.wm.SetGamma(module.wm_index, 0.9);
+%             ia.wm.SetLearningRate(module.wm_index, 0.01);
+            
+            module.reward = 0;
+            module.prev_reward = 0;
+            module.acc_reward = 0;
+            
+            module.out_mask = zeros(1, output_size);
+            module.time = 0;
+            
+            ia.modules{index} = module;
+        end
+        
+        function index = NewTrainedIntentionalModule(ia, sources, training_set, output_size)
+            tset_size = size(training_set, 1);
+            index = ia.NewIntentionalModule(sources, tset_size, output_size);
+            
+            ia.UpdateTrainingSet(index, training_set);
+            ia.TrainIntentionalModule(index);
+        end
+        
+        function Update(ia)
+            ia.UpdateInputModules();
+            ia.UpdateIntentionalModules();
+            ia.UpdateGraph();
+        end
+        
+    end
+    
+    methods
+        
+        function size = GetModuleOutputSize(ia, indeces)
+            size = 0;
+            for ii = 1:length(indeces)
+                index = indeces(ii);
+                size = size + length(ia.modules{index}.output);
+            end
+        end
+        
+        function size = GetModuleInputSize(ia, indeces)
+            size = 0;
+            for ii = 1:length(indeces)
+                index = indeces(ii);
+                size = size + length(ia.modules{index}.input);
+            end
+        end
+        
+        function out = GetModuleOutput(ia, indeces)
+            out = [];
+            for ii = 1:length(indeces)
+                index = indeces(ii);
+                out = cat(2, out, ia.modules{index}.output);
+            end
+        end
+        
+        function rewards = GetModuleReward(ia, indeces)
+            rewards = [];
+            for ii = 1:length(indeces)
+                index = indeces(ii);
+                rewards = cat(2, rewards, ia.modules{index}.reward);
+            end
+        end
+        
+        function SetModuleInput(ia, index, values)
+           ia.modules{index}.input = values;
+        end
+        
+        function parents = GetInputModules(ia, indeces)
+            parents = ia.GetParentModules(indeces);
+        end
+        
+        function childrens = GetChildrenModules(ia, indeces)
+            childrens = find( any(ia.connections(:,indeces), 2) == true );
+        end
+        
+        function parents = GetParentModules(ia, indeces)
+            parents = find(ia.connections( indeces,:) == 1);
+        end
+        
+        function siblings = GetSiblingModules(ia, indeces)
+           parents = ia.GetParentModules(indeces);
+           siblings = ia.GetChildrenModules(parents);
+           siblings = siblings(siblings ~= indeces);
+        end
+        
+        function layers_count = CountLayers(ia)
+            inputs = find(all(ia.connections' == 0, 1));
+            
+            layers_count = 0;
+            
+            childrens = ia.GetChildrenModules(inputs);
+            
+            while ~isempty(childrens)
+                layers_count = layers_count + 1;
+                childrens = ia.GetChildrenModules(childrens);
+            end
+        end
+        
+        function booting = AreChildrenBootstraping(ia,index)
+            childrens = ia.GetChildrenModules(index);
+            
+            booting = any( ia.IsBootstraping(childrens) );
+        end
+        
+        function UpdateInputModules(ia)
+            indeces = find(ia.modules_type == ia.TYPE_INPUT);
+            
+            for ii = 1:length(indeces)
+                index = indeces(ii);
+                module = ia.modules{index};
+                
+                module.output = module.input;
+                
+                ia.modules{index} = module;
+            end
+        end
+        
+        function UpdateIntentionalModules(ia)
+            indeces = find(ia.modules_type == ia.TYPE_BOOTSTRAPING);
+            
+            for ii = 1:length(indeces)
+                index = indeces(ii);
+                sources = ia.GetParentModules(index);
+                
+                sa = ia.GetModuleActivation(sources);
+
+
+                if any(ia.IsBootstraping(sources))
+                    continue;
+                end
+
+                if max(sa) < ia.threshold
+                    continue;
+                end
+                
+                ia.TrainIntentionalModule(index);
+            end
+            
+            indeces = find(ia.modules_type == ia.TYPE_IM);
+            
+            for ii = 1:length(indeces)
+                index = indeces(ii);
+                module = ia.modules{index};
+                
+                input = ia.GetModuleOutput(module.sources);
+                module.input = input;
+                
+                ica_weights = ia.ProcessForward(module,input);
+                
+
+                
+                
+                retained_chunks = [];
+                
+                update = module.xx > 5;
+                
+                module.xx = module.xx + 1;
+                if  update
+                    module.xx = 0;
+                    rew = module.acc_reward;
+                    drew = (module.acc_reward - module.prev_reward);
+                
+                    ia.wm.SetState(module.wm_index, input);
+                    ia.wm.SetReward(module.wm_index, rew + drew);
+                    chunks = eye(length(ica_weights)).* repmat(ica_weights, length(ica_weights), 1);% .* repmat(sim, output_size, 1);% .* repmat((sim > module.threshold), output_size, 1);
+                    
+                    ia.wm.SetCandidateChunks(module.wm_index, chunks);
+                    
+                    ia.wm.EpisodeTick(module.wm_index);
+                    module.prev_reward = module.acc_reward;
+                    module.acc_reward = 0;
+                end
+
+                
+                retained_chunks = ia.wm.GetRetainedChunks(module.wm_index);
+                
+                
+                module.output_changed = false;
+                if ~isempty(retained_chunks) && any(retained_chunks ~= module.out_mask) && update
+                	retained_chunks = sum(retained_chunks, 1);
+                    module.out_mask = retained_chunks;
+                    module.output_changed = true;
+                else
+                    module.out_mask = zeros(1, length(ica_weights));
+                end
+                
+                
+                
+                rec_in=ia.ProcessBackward(module,ica_weights);
+                
+                %--
+%                 ia.graphs{index}.rec_1.YData = input;
+%                 ia.graphs{index}.rec_2.YData = rec_in;
+                if index < 1
+                    ia.graphs{index}.output.XData = ica_weights(:,1);
+                    if length(ica_weights) > 1
+                        ia.graphs{index}.output.YData = ica_weights(:,2);
+                    end
+                    if length(ica_weights) > 2
+                        ia.graphs{index}.output.ZData = ica_weights(:,3);
+                    end
+                end
+                %--
+                
+                ica_weights = ica_weights .* module.out_mask;
+                
+                similarity = ia.GetCentroidsDistance(module, ia.gain, ica_weights);
+                
+%                 sim = sim ./sum(sim);
+                
+                output_size = length(module.output);
+                
+                children = ia.GetChildrenModules(index);
+                bootstraping = any(ia.IsBootstraping(1:ia.CountModules()));
+                
+                
+                module.acc_reward = module.acc_reward + module.reward;
+                
+                if bootstraping
+                   ia.wm.SetExplorationPercentage(module.wm_index, 1);
+                else
+%                     if module.time > 2000
+%                 	ia.wm.SetExplorationPercentage(module.wm_index, 0);
+%                     else
+%                 	ia.wm.SetExplorationPercentage(module.wm_index, 1);
+%                     end
+                end
+                
+                
+%                 sim(sim < max(sim)) = 0;
+                
+                module.similarities = similarity;
+                module.output = similarity;
+                
+                module.activation = max(module.output);
+                
+
+                module.time = module.time + 1;
+                ia.modules{index} = module;
+                
+            end
+            
+        end
+        
+        function UpdateCentroids(ia)
+            
+            curr = find(ia.modules_type == ia.TYPE_INPUT);
+            layer = ia.GetChildrenModules(curr);
+            
+            while ~isempty(layer)
+                act = ia.GetNodesActivation(layer);
+                max_active = layer(act == max(act));
+                max_active= max_active(1);
+                other = layer(act ~= max(act));
+                if act <= 0
+                    break;
+                end
+
+                %---------------------------------------
+                module = ia.modules{max_active};
+                
+                x = ia.ProcessForward(module, module.input);
+                
+                dists = ia.GetCentroidsDistance(module, ia.gain, x);
+                
+                lr = 10^-0.5;
+                g = ia.gain;
+                
+                centroid_max_active = find(dists == max(dists));
+
+                for jj = 1:size(centroid_max_active,1)
+                    kk = centroid_max_active(jj);
+                    
+                    p = module.centroids(kk,:);
+
+                    meand = max(10^-3, module.centroids_mean_distance(kk));
+
+                    c = meand/sqrt(2*log(2));
+                    llr = lr;
+                    p = p + llr * exp( -1/(2*g*c^2) * (sum((x-p).^2)) ) * 1/(g*c^2) *(x - p).*p;
+                    
+                    ia.modules{max_active}.centroids(kk,:) = p;
+                end
+                
+                for mm = 1: length(other)
+                    index = other(mm);
+                    module = ia.modules{index};
+                    x = ia.ProcessForward(module, module.input);
+                    dists = ia.GetCentroidsDistance(module, ia.gain, x);
+                    centroid_max_active = find(dists == max(dists));
+                    
+                    for jj = 1:size(centroid_max_active,1)
+                        kk = centroid_max_active(jj);
+                        p = module.centroids(kk,:);
+
+                        meand = max(10^-3, module.centroids_mean_distance(kk));
+
+                        c = meand/sqrt(2*log(2));
+                        llr = lr * dists(kk);
+                        try
+                        p = p - llr * exp( -1/(2*g*c^2) * (sum((x-p).^2)) ) * 1/(g*c^2) *(x - p).*p;
+                        catch
+                        end
+                        
+                        ia.modules{index}.centroids(kk,:) = p;
+                    end
+                end
+                
+                %---------------------------------------
+                curr = layer;
+                layer = ia.GetChildrenModules(curr);
+            end
+            
+        end
+        
+        function full = UpdateTrainingSet(ia, index, input)
+           module = ia.modules{index};
+           curr_count = module.training_count;
+           max_count = size(module.training_set, 1);
+           input_length = size(input, 1);
+           
+           
+           if curr_count < max_count
+               new_count = min(curr_count + input_length, max_count);
+               ia.modules{index}.training_set(curr_count + 1:new_count, :) = input(1:new_count-curr_count, :);
+               ia.modules{index}.training_count = new_count;
+               
+               if new_count == max_count
+                   full = true;
+               else
+                   full = false;
+               end
+               
+           else
+              full = true; 
+           end
+        end
+        
+        function UpdateGraph(ia)
+            
+            count = ia.CountModules();
+            
+            if count ~= ia.network_graph_count
+                ia.network_graph_count = count;
+                ia.network_graph = digraph(ia.connections(1:count, 1:count));
+
+                figure(ia.network_graph_fig_no);
+                ia.network_graph_plot = plot(ia.network_graph);
+                highlight(ia.network_graph_plot, 1:count);
+            end
+            
+            for ii = 1:count
+                pp = max(0, min(ia.modules{ii}.activation,1));
+                cc = 0;
+                if ia.modules{ii}.output_changed
+                    cc = 0.9;
+                end
+                highlight(ia.network_graph_plot, ii, 'NodeColor', [1 - pp, pp, cc]);
+            end
+            highlight(ia.network_graph_plot,ia.network_graph,'EdgeColor',[0 0.4470 0.7410],'LineWidth',0.33);
+
+            max_active_adj = ia.connections(1:count, 1:count);
+            
+            for ii = 1:count
+                if ~ia.modules{ii}.output_changed
+                    max_active_adj(:,ii) = 0;
+                end
+            end
+            
+            h = digraph(max_active_adj);
+            highlight(ia.network_graph_plot, h, 'EdgeColor','black','LineWidth',2)
+        end
+        
+        function NewEpisode(ia)
+            indeces = find(ia.modules_type == ia.TYPE_IM);
+            
+            for ii = 1:length(indeces)
+                index = indeces(ii);
+                module = ia.modules{index};
+                
+                state = zeros(1, size(module.similarities, 2));
+                
+                ia.modules{index}.similarities = zeros(size(module.similarities));
+                ia.modules{index}.input = zeros(size(module.input));
+                ia.modules{index}.output = zeros(size(module.output));
+                
+                ia.wm.EpisodeTick(module.wm_index)
+                
+                ia.wm.SetState(module.wm_index, state);
+                ia.wm.SetReward(module.wm_index, 0);
+                ia.wm.NewEpisode(module.wm_index);
+            end
+        end
+        
+        function SetReward(ia, amount)
+             indeces = find(ia.modules_type == ia.TYPE_IM);
+            
+            for ii = 1:length(indeces)
+                index = indeces(ii);
+                ia.modules{index}.reward = amount;
+            end
+        end
+        
+        function a = GetModuleActivation(ia, indeces)
+            l = length(indeces);
+            a = zeros(1, l);
+            
+            for ii = 1:l
+                a(ii) = ia.modules{indeces(ii)}.activation;
+            end
+        end
+        
+        function TrainIntentionalModule(ia, index)
+            module = ia.modules{index};
+            
+            sources = module.sources;
+            
+            
+            
+            input = ia.GetModuleOutput(sources);
+            
+            
+            if ia.UpdateTrainingSet(index, input)
+                
+                training_set = ia.modules{index}.training_set;
+                training_set_size = size(training_set, 1);
+                
+                sampled_set_size = ceil(training_set_size * ia.sampling_percentage);
+                
+                w = ia.modules{index}.sampling_weights;
+                
+                samples = randsample(training_set_size, sampled_set_size, true,w);
+                
+                sampled_training_set = training_set(samples, :);
+                sampled_training_set = sampled_training_set(randperm(size(sampled_training_set,1)),:);
+                
+                %---------------- MODULE TRAINING ------------------ begin
+                sigin = sampled_training_set;
+                
+                [pc.coeff, pc.score, pc.latent, pc.tsquared, pc.explained, pc.mu] = pca(sigin);
+                
+                
+                
+                perc = cumsum(pc.latent) / sum(pc.latent);
+                
+                var_hold = 1;
+                perc(perc > var_hold) = 0;
+                
+                perc(perc > 0) = 1;
+                
+                perc(1) = 1;
+                
+                [pc.coeff, pc.score, pc.latent, pc.tsquared, pc.explained, pc.mu] = pca(sigin, 'NumComponents', sum(perc));
+                
+                
+                [ica.ics, ica.A, ica.W] = fastica(pc.score, 'numOfIc', 256);
+                
+                module.ica = ica;
+                module.pca = pc;
+                
+                k = ia.GetModuleOutputSize(index);
+                kk = ceil(ia.centroids_multiplier * k);
+                
+                tset_W = ia.ProcessForward(module, training_set);
+                
+                
+                [centroids, ~, meand] = categorizeInput(tset_W, kk);
+                
+                samples = randsample(kk, kk - k);
+                
+                centroids(samples, :) = [];
+                
+                meand(samples) = [];
+                
+                
+                module.centroids = centroids;
+                module.centroids_mean_distance = meand';
+                module.bootstraping = false;
+                
+                
+                module.wm_index = ia.wm.NewWMModule(1, ia.GetModuleInputSize(index), size(ica.ics,1));
+            
+                ia.wm.SetGamma(module.wm_index, 0.9);
+                ia.wm.SetLearningRate(module.wm_index, 0.005);
+                
+                
+                ia.modules{index} = module;
+                ia.modules_type(index) = ia.TYPE_IM;
+                
+                
+                %---------------- MODULE TRAINING ------------------ end
+                
+            
+            
+                module = ia.modules{index};
+                
+                current_output = ia.ProcessForward(module, input);
+                figure(index * 13);
+                
+                hold on;
+                
+                for aa = size(tset_W,2)+1:3
+                    tset_W(:,aa) = zeros(size(tset_W,1),1);
+                end
+                for aa = size(centroids,2)+1:3
+                    centroids(:,aa) = zeros(size(centroids,1),1);
+                end
+                for aa = size(current_output,2)+1:3
+                    current_output(:,aa) = zeros(size(current_output,1),1);
+                end
+                ia.graphs{index}.training = scatter3(tset_W(:,1 ),tset_W(:, 2),tset_W(:, 3), 'G', '.');
+                ia.graphs{index}.centroids = scatter3(centroids(:,1 ),centroids(:, 2),centroids(:, 3), 'B');
+                ia.graphs{index}.output = scatter3(current_output(:,1 ),current_output(:, 2),current_output(:, 3), 'R');
+                hold off;
+                axis auto;
+                grid on;
+                %--
+%                 figure(1001*index);
+%                 hold on;
+%                 ia.graphs{index}.rec_1 = plot(zeros(1, length(ia.modules{index}.input)), 'B');
+%                 ia.graphs{index}.rec_2 = plot(zeros(1, length(ia.modules{index}.input)), 'R');
+%                 grid on;
+%                 hold off;
+                %--
+            end
+        end
+        
+        function inputs = ProcessBackward(~, module, points)
+            
+            ics = module.ica.ics;
+            
+            pcs = module.pca;
+            mu = pcs.mu;
+            coeff = pcs.coeff';
+            
+            
+            
+            inputs = points * ics;
+            
+            inputs = (inputs * coeff) + repmat(mu, size(inputs,1), 1);
+        end
+        
+        function outputs = ProcessForward(~, module, inputs)
+            
+            ics = module.ica.ics;
+            pcs = module.pca;
+            mu = pcs.mu;
+            coeff = pcs.coeff';
+            
+            in_pca = (inputs - repmat(mu, size(inputs,1), 1)) * pinv(coeff);
+            
+            outputs = in_pca*pinv(ics);
+        end
+       
+        function sim = GetCentroidsDistance(ia, module, gain, points)
+            centroids = module.centroids;
+            
+            count_centroids = size(centroids, 1);
+            count_points = size(points, 1);
+            
+            
+            meand = module.centroids_mean_distance;
+            
+            dists = pdist(cat(1, points, centroids), 'euclidean');
+            
+            dists = dists(1:count_centroids * count_points);
+
+            dists = reshape(dists, count_centroids, count_points)';
+
+            c = max([meand; 10^-2*ones(size(meand))], [], 1);
+            
+            c = repmat(c, count_points, 1);
+            
+            b = 1./(2*gain*c.^2);
+            
+            sim = exp(-b/gain .* (dists.^2));
+
+        end
+        
+        function [centroid, centroid_index, dist] = FindNearestCentroid(ia, module, point)
+            centroids = module.centroids;
+            dd = ia.GetCentroidsDistance(centroids, ia.gain, point);
+            
+            dist = min(dd);
+            
+            centroid_index = find(dd == dist);
+            centroid_index = centroid_index(1);
+            
+            centroid = centroids(centroid_index, :);
+            
+            centroid_index = find(centroid_index);
+        end
+        
+        function index = NextIndex(ia, nodeType)
+            while ia.CountModules() >= ia.MaxSize()
+                ia.DoubleSize();
+            end
+            
+            index = ia.CountModules() + 1;
+            ia.next_index = ia.next_index + 1;
+            
+            ia.modules_type(index) = nodeType;
+        end
+        
+        function index = NewContextModule(ia, source_module_index)
+            
+            index = ia.NextIndex(ia.TYPE_CONTEXT);
+            
+            input_size = ia.GetModuleInputSize(source_module_index);
+            output_size = ia.GetModuleOutputSize(source_module_index);
+            module = [];
+            
+            module.source = source_module_index;
+            module.input = zeros(input_size,1);
+            module.output = zeros(output_size, 1);
+            module.receptors = ia.context.NextAvailableIndeces( output_size )';
+            module.activation = 0;
+            
+            module.cache_size = 1000;
+            module.cache_count = 0;
+            module.cache = zeros(module.cache_size, output_size);
+            
+            ia.modules{index} = module;
+            
+        end
+        
+        function DoubleSize(ia)
+            
+            curr_size = length(ia.modules);
+            new_size = 2 * curr_size;
+            increase = new_size - curr_size;
+            
+            ia.modules = cat(1, ia.modules, cell(increase,1));
+            
+            
+            old_connections = ia.connections;
+            ia.connections = zeros(new_size, new_size);
+            ia.connections(1:curr_size, 1:curr_size) = old_connections;
+            
+            ia.modules_type = cat(1, ia.modules_type, zeros(increase,1));
+            
+            ia.graphs = cat(1, ia.graphs, cell(increase,1));
+        end
+        
+    end
+end
+
